@@ -1,0 +1,265 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <LittleFS.h>
+#include <Preferences.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <sys/time.h>
+#include "esp_sleep.h"
+#include "esp_wifi.h"
+
+// ---------- Seaded ----------
+#define ONE_WIRE_PIN   4
+#define BTN_PIN        3
+#define SLEEP_US       (6ULL * 3600ULL * 1000000ULL)  // 4 mõõtmist päevas
+#define READS_PER_DAY  4
+#define AP_SSID        "Suvila-logger"
+#define AP_PASS        "muuda-mind-123"               // vähemalt 8 märki
+#define AP_CHANNEL     1
+#define AP_TIMEOUT_MS  (5UL * 60UL * 1000UL)          // 5 min tegevuseta -> magama
+#define TX_POWER       WIFI_POWER_19_5dBm             // kui ühendus ei tõuse, proovi WIFI_POWER_8_5dBm
+#define USE_11B        1                              // 1 = aeglane, aga pikema levikuga režiim
+
+OneWire oneWire(ONE_WIRE_PIN);
+DallasTemperature sensors(&oneWire);
+Preferences prefs;
+WebServer server(80);
+
+RTC_DATA_ATTR int64_t nextMeasUs = 0;   // järgmise mõõtmise aeg (säilib deep sleep'is)
+bool apDone = false;
+unsigned long lastActivity = 0;
+
+int64_t nowUs() {
+  struct timeval tv;
+  gettimeofday(&tv, nullptr);
+  return (int64_t)tv.tv_sec * 1000000LL + tv.tv_usec;
+}
+
+void goToSleep(uint64_t us, bool allowButton) {
+  if (us < 1000000ULL) us = 1000000ULL;
+  if (allowButton)
+    esp_deep_sleep_enable_gpio_wakeup(1ULL << BTN_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+  esp_sleep_enable_timer_wakeup(us);
+  esp_deep_sleep_start();
+}
+
+bool validTemp(float t) {
+  return t != DEVICE_DISCONNECTED_C && t != 85.0;
+}
+
+// ---------- Mõõtmine ----------
+void measureAndLog() {
+  sensors.begin();
+  sensors.setResolution(12);
+  int count = sensors.getDeviceCount();
+
+  float ground = NAN, air = NAN;
+  for (int i = 0; i < 3; i++) {
+    sensors.requestTemperatures();
+    float t0 = sensors.getTempCByIndex(0);
+    if (validTemp(t0)) {
+      ground = t0;
+      if (count > 1) {
+        float t1 = sensors.getTempCByIndex(1);
+        if (validTemp(t1)) air = t1;
+      }
+      break;
+    }
+    delay(200);
+  }
+
+  prefs.begin("log", false);
+  uint32_t n = prefs.getUInt("n", 0) + 1;
+  prefs.putUInt("n", n);
+  prefs.end();
+
+  bool newFile = !LittleFS.exists("/log.csv");
+  File f = LittleFS.open("/log.csv", "a");
+  if (f) {
+    if (newFile) f.print("nr,maa,ohk\n");
+    f.printf("%u,", (unsigned)n);
+    if (isnan(ground)) f.print("ERR,"); else f.printf("%.2f,", ground);
+    if (count > 1) { if (isnan(air)) f.print("ERR"); else f.printf("%.2f", air); }
+    f.print("\n");
+    f.close();
+  }
+}
+
+// ---------- Kokkuvõte ----------
+String getField(const String& line, int idx) {
+  int start = 0;
+  for (int i = 0; i < idx; i++) {
+    start = line.indexOf(',', start);
+    if (start < 0) return "";
+    start++;
+  }
+  int end = line.indexOf(',', start);
+  if (end < 0) end = line.length();
+  String s = line.substring(start, end);
+  s.trim();
+  return s;
+}
+
+bool isNum(const String& s) { return s.length() > 0 && s != "ERR"; }
+
+String buildSummary() {
+  File f = LittleFS.open("/log.csv", "r");
+  if (!f) return "Logi on tühi.";
+
+  unsigned int cnt = 0, errs = 0, frost = 0, marginal = 0;
+  unsigned int minN = 0, maxN = 0, minAirN = 0, nLast = 0;
+  float minT = 1000, maxT = -1000, sumT = 0, minAir = 1000;
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0 || !isdigit(line[0])) continue;
+
+    unsigned int n = getField(line, 0).toInt();
+    nLast = n;
+    String g = getField(line, 1), a = getField(line, 2);
+
+    if (isNum(g)) {
+      float t = g.toFloat();
+      cnt++; sumT += t;
+      if (t < minT) { minT = t; minN = n; }
+      if (t > maxT) { maxT = t; maxN = n; }
+      if (t <= 0.0) frost++;
+      else if (t <= 1.0) marginal++;
+    } else errs++;
+
+    if (isNum(a)) {
+      float t = a.toFloat();
+      if (t < minAir) { minAir = t; minAirN = n; }
+    }
+  }
+  f.close();
+
+  String s;
+  char b[160];
+  snprintf(b, sizeof(b), "Mõõtmisi: %u (vigaseid: %u), ~%.0f päeva<br>", cnt, errs, nLast / (float)READS_PER_DAY);
+  s += b;
+  if (cnt) {
+    snprintf(b, sizeof(b), "<b>MAA min:</b> %.2f °C (nr %u, ~%.1f. päev)<br>", minT, minN, minN / (float)READS_PER_DAY); s += b;
+    snprintf(b, sizeof(b), "MAA max: %.2f °C (nr %u, ~%.1f. päev)<br>", maxT, maxN, maxN / (float)READS_PER_DAY); s += b;
+    snprintf(b, sizeof(b), "MAA keskmine: %.2f °C<br>", sumT / cnt); s += b;
+    snprintf(b, sizeof(b), "Mõõtmisi &le; 0 °C: %u<br>Mõõtmisi 0...+1 °C: %u<br>", frost, marginal); s += b;
+  }
+  if (minAir < 999) {
+    snprintf(b, sizeof(b), "ÕHK min: %.2f °C (nr %u, ~%.1f. päev)<br>", minAir, minAirN, minAirN / (float)READS_PER_DAY); s += b;
+  }
+  return s;
+}
+
+// ---------- Veebileht ----------
+void handleRoot() {
+  lastActivity = millis();
+  long minsLeft = (long)((nextMeasUs - nowUs()) / 60000000LL);
+  if (minsLeft < 0) minsLeft = 0;
+
+  String p = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+             "<title>Suvila logger</title><style>"
+             "body{font-family:sans-serif;margin:16px;max-width:600px;line-height:1.5}"
+             "a.b,button{display:block;box-sizing:border-box;width:100%;padding:14px;margin:12px 0;"
+             "background:#185FA5;color:#fff;text-align:center;border:0;border-radius:8px;"
+             "font-size:18px;text-decoration:none}"
+             "button.r{background:#A32D2D}button.g{background:#5F5E5A}"
+             "</style></head><body><h2>Suvila logger</h2>";
+  p += buildSummary();
+  p += "<br>Järgmine mõõtmine ~" + String(minsLeft) + " min pärast.";
+  p += "<a class='b' href='/log.csv'>Lae alla log.csv</a>";
+  p += "<a class='b g' href='/done'>Valmis (mine magama)</a>";
+  p += "<button class='r' onclick=\"if(confirm('Kustutada kogu logi?'))location='/clear'\">Kustuta logi</button>";
+  p += "</body></html>";
+  server.send(200, "text/html; charset=utf-8", p);
+}
+
+void handleCsv() {
+  lastActivity = millis();
+  File f = LittleFS.open("/log.csv", "r");
+  if (!f) { server.send(404, "text/plain", "Logi on tühi"); return; }
+  server.sendHeader("Content-Disposition", "attachment; filename=log.csv");
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+void handleClear() {
+  lastActivity = millis();
+  LittleFS.remove("/log.csv");
+  prefs.begin("log", false);
+  prefs.putUInt("n", 0);
+  prefs.end();
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleDone() {
+  server.send(200, "text/html; charset=utf-8",
+              "<html><body style='font-family:sans-serif;margin:16px'>"
+              "<h2>Valmis</h2>Seade läheb magama. Võid magneti eemaldada.</body></html>");
+  delay(300);
+  apDone = true;
+}
+
+// ---------- Pääsupunkti seanss ----------
+void runAccessPoint() {
+  pinMode(BTN_PIN, INPUT);
+
+  // USB varundus: kui kaabel on ühendatud, prindi logi ka Serialisse
+  Serial.begin(115200);
+  delay(1000);
+  if (Serial) {
+    Serial.println("--- LOG START ---");
+    File f = LittleFS.open("/log.csv", "r");
+    if (f) { while (f.available()) Serial.write(f.read()); f.close(); }
+    Serial.println("--- LOG END ---");
+  }
+
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, 2);
+  WiFi.setTxPower(TX_POWER);
+#if USE_11B
+  esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B);
+#endif
+
+  server.on("/", handleRoot);
+  server.on("/log.csv", handleCsv);
+  server.on("/clear", handleClear);
+  server.on("/done", handleDone);
+  server.begin();
+
+  lastActivity = millis();
+  while (!apDone && millis() - lastActivity < AP_TIMEOUT_MS) {
+    server.handleClient();
+    delay(2);
+  }
+
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+
+// ---------- Põhiprogramm ----------
+void setup() {
+  LittleFS.begin(true);
+
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+    runAccessPoint();
+
+    // oota, kuni magnet eemaldatud (max 30 s), muidu ärkaks seade kohe uuesti
+    unsigned long t0 = millis();
+    while (digitalRead(BTN_PIN) == LOW && millis() - t0 < 30000) delay(50);
+    bool released = (digitalRead(BTN_PIN) == HIGH);
+
+    int64_t remaining = nextMeasUs - nowUs();
+    goToSleep(remaining > 0 ? (uint64_t)remaining : 1000000ULL, released);
+  }
+
+  // taimer või esmakordne käivitus: mõõda
+  measureAndLog();
+  nextMeasUs = nowUs() + (int64_t)SLEEP_US;
+  goToSleep(SLEEP_US, digitalRead(BTN_PIN) == HIGH);
+}
+
+void loop() {}
