@@ -1,0 +1,144 @@
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <LittleFS.h>
+#include <Preferences.h>
+#include "esp_sleep.h"
+
+#define ONE_WIRE_PIN  4
+#define BTN_PIN       3
+#define SLEEP_US      (6ULL * 3600ULL * 1000000ULL)  // 4 mõõtmist päevas
+#define READS_PER_DAY 4
+
+OneWire oneWire(ONE_WIRE_PIN);
+DallasTemperature sensors(&oneWire);
+Preferences prefs;
+
+void goToSleep() {
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << BTN_PIN, ESP_GPIO_WAKEUP_GPIO_LOW);
+  esp_sleep_enable_timer_wakeup(SLEEP_US);
+  esp_deep_sleep_start();
+}
+
+bool validTemp(float t) {
+  return t != DEVICE_DISCONNECTED_C && t != 85.0;
+}
+
+String getField(const String& line, int idx) {
+  int start = 0;
+  for (int i = 0; i < idx; i++) {
+    start = line.indexOf(',', start);
+    if (start < 0) return "";
+    start++;
+  }
+  int end = line.indexOf(',', start);
+  if (end < 0) end = line.length();
+  String s = line.substring(start, end);
+  s.trim();
+  return s;
+}
+
+bool isNum(const String& s) { return s.length() > 0 && s != "ERR"; }
+
+void printSummary() {
+  File f = LittleFS.open("/log.csv", "r");
+  if (!f) { Serial.println("(tühi)"); return; }
+
+  unsigned int cnt = 0, errs = 0, frost = 0, marginal = 0;
+  unsigned int minN = 0, maxN = 0, minAirN = 0, nLast = 0;
+  float minT = 1000, maxT = -1000, sumT = 0, minAir = 1000;
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+
+    unsigned int n = getField(line, 0).toInt();
+    nLast = n;
+    String g = getField(line, 1), a = getField(line, 2);
+
+    if (isNum(g)) {
+      float t = g.toFloat();
+      cnt++; sumT += t;
+      if (t < minT) { minT = t; minN = n; }
+      if (t > maxT) { maxT = t; maxN = n; }
+      if (t <= 0.0) frost++;
+      else if (t <= 1.0) marginal++;
+    } else errs++;
+
+    if (isNum(a)) {
+      float t = a.toFloat();
+      if (t < minAir) { minAir = t; minAirN = n; }
+    }
+  }
+  f.close();
+
+  Serial.printf("Mõõtmisi: %u (vigaseid: %u), ~%.0f päeva\n", cnt, errs, nLast / (float)READS_PER_DAY);
+  if (cnt) {
+    Serial.printf("MAA  min: %.2f C (nr %u, ~%.1f. päev)\n", minT, minN, minN / (float)READS_PER_DAY);
+    Serial.printf("MAA  max: %.2f C (nr %u, ~%.1f. päev)\n", maxT, maxN, maxN / (float)READS_PER_DAY);
+    Serial.printf("MAA  keskmine: %.2f C\n", sumT / cnt);
+    Serial.printf("Mõõtmisi <= 0 C: %u, 0...+1 C: %u\n", frost, marginal);
+  }
+  if (minAir < 999)
+    Serial.printf("ÕHK  min: %.2f C (nr %u, ~%.1f. päev)\n", minAir, minAirN, minAirN / (float)READS_PER_DAY);
+}
+
+void dumpLog() {
+  Serial.begin(115200);
+  unsigned long t0 = millis();
+  while (!Serial && millis() - t0 < 5000) delay(10);
+  for (int i = 0; i < 12; i++) {
+    Serial.println("--- KOKKUVÕTE ---");
+    printSummary();
+    Serial.println("--- LOG START (nr,maa,ohk) ---");
+    File f = LittleFS.open("/log.csv", "r");
+    if (f) { while (f.available()) Serial.write(f.read()); f.close(); }
+    Serial.println("--- LOG END ---");
+    delay(5000);
+  }
+}
+
+void setup() {
+  LittleFS.begin(true);
+
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+    dumpLog();
+    goToSleep();
+  }
+
+  sensors.begin();
+  sensors.setResolution(12);
+  int count = sensors.getDeviceCount();
+
+  float ground = NAN, air = NAN;
+  for (int i = 0; i < 3; i++) {
+    sensors.requestTemperatures();
+    float t0 = sensors.getTempCByIndex(0);
+    if (validTemp(t0)) {
+      ground = t0;
+      if (count > 1) {
+        float t1 = sensors.getTempCByIndex(1);
+        if (validTemp(t1)) air = t1;
+      }
+      break;
+    }
+    delay(200);
+  }
+
+  prefs.begin("log", false);
+  uint32_t n = prefs.getUInt("n", 0) + 1;
+  prefs.putUInt("n", n);
+  prefs.end();
+
+  File f = LittleFS.open("/log.csv", "a");
+  if (f) {
+    f.printf("%u,", (unsigned)n);
+    if (isnan(ground)) f.print("ERR,"); else f.printf("%.2f,", ground);
+    if (count > 1) { if (isnan(air)) f.print("ERR"); else f.printf("%.2f", air); }
+    f.print("\n");
+    f.close();
+  }
+  goToSleep();
+}
+
+void loop() {}
