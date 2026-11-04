@@ -232,6 +232,10 @@ void runAccessPoint() {
 
 // ---------- Põhiprogramm ----------
 void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println();
+  Serial.printf("Ärkasin, reset reason: %u\n", (unsigned)ESP.getResetInfoPtr()->reason);
   WiFi.persistent(false);
   WiFi.mode(WIFI_OFF);
   LittleFS.begin();
@@ -251,13 +255,15 @@ void setup() {
     if (gRtc.hopsLeft == 0) {
       measureAndLog();
       gRtc.hopsLeft = HOPS_PER_MEAS;
+      Serial.printf("Mõõdetud: maa=%.2f, andureid=%d\n", ground, count);
     }
   } else {
     // esmakordne käivitus või toide katkes: mõõda kohe
     measureAndLog();
     gRtc.hopsLeft = HOPS_PER_MEAS;
   }
-
+  Serial.printf("hopsLeft=%u, magan\n", (unsigned)gRtc.hopsLeft);
+  Serial.flush();
   rtcSave(gRtc);
   sleepFor(HOP_US);
 }
