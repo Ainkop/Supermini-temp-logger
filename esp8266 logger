@@ -256,7 +256,7 @@ void setup() {
     if (gRtc.hopsLeft == 0) {
       measureAndLog();
       gRtc.hopsLeft = HOPS_PER_MEAS;
-      #Serial.printf("Mõõdetud: maa=%.2f, andureid=%d\n", ground, count);
+      
     }
   } else {
     // esmakordne käivitus või toide katkes: mõõda kohe
