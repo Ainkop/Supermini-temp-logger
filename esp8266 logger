@@ -6,8 +6,9 @@
 
 // ---------- Seaded ----------
 #define ONE_WIRE_PIN   2
-#define HOP_US         (3600ULL * 1000000ULL)   // ärkab iga tund
-#define HOPS_PER_MEAS  6                        // mõõdab iga 6. tund = 4x päevas
+#define HOP_US         (10ULL * 1000000ULL)   // ärkab iga 10s  (3600ULL * 1000000ULL)   // ärkab iga tund
+#define HOPS_PER_MEAS  3                      // mõõdab iga 30 s  
+//#define HOPS_PER_MEAS  6 mõõdab iga 6. tund = 4x päevas
 #define READS_PER_DAY  4
 #define AP_SSID        "Suvila-logger"
 #define AP_PASS        "muuda-mind-123"         // vähemalt 8 märki
