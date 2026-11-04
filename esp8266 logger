@@ -1,0 +1,265 @@
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <LittleFS.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ---------- Seaded ----------
+#define ONE_WIRE_PIN   2
+#define HOP_US         (3600ULL * 1000000ULL)   // ärkab iga tund
+#define HOPS_PER_MEAS  6                        // mõõdab iga 6. tund = 4x päevas
+#define READS_PER_DAY  4
+#define AP_SSID        "Suvila-logger"
+#define AP_PASS        "muuda-mind-123"         // vähemalt 8 märki
+#define AP_CHANNEL     1
+#define AP_TIMEOUT_MS  (5UL * 60UL * 1000UL)
+#define TX_DBM         17.0f                    // kui toide kukub kokku, proovi 14.0f
+#define USE_11B        1
+#define RTC_MAGIC      0xC0FFEE42
+
+OneWire oneWire(ONE_WIRE_PIN);
+DallasTemperature sensors(&oneWire);
+ESP8266WebServer server(80);
+
+struct RtcData { uint32_t magic; uint32_t hopsLeft; };
+RtcData gRtc;
+bool apDone = false;
+unsigned long lastActivity = 0;
+
+bool rtcLoad(RtcData &r) {
+  return ESP.rtcUserMemoryRead(0, (uint32_t*)&r, sizeof(r)) && r.magic == RTC_MAGIC;
+}
+void rtcSave(RtcData &r) {
+  r.magic = RTC_MAGIC;
+  ESP.rtcUserMemoryWrite(0, (uint32_t*)&r, sizeof(r));
+}
+void sleepFor(uint64_t us) {
+  if (us < 1000000ULL) us = 1000000ULL;
+  ESP.deepSleep(us);
+  delay(100);
+}
+
+bool validTemp(float t) {
+  return t != DEVICE_DISCONNECTED_C && t != 85.0;
+}
+
+uint32_t nextN() {
+  uint32_t n = 0;
+  File f = LittleFS.open("/n", "r");
+  if (f) { n = f.parseInt(); f.close(); }
+  n++;
+  f = LittleFS.open("/n", "w");
+  if (f) { f.print(n); f.close(); }
+  return n;
+}
+
+// ---------- Mõõtmine ----------
+void measureAndLog() {
+  sensors.begin();
+  sensors.setResolution(12);
+  int count = sensors.getDeviceCount();
+
+  float ground = NAN, air = NAN;
+  for (int i = 0; i < 3; i++) {
+    sensors.requestTemperatures();
+    float t0 = sensors.getTempCByIndex(0);
+    if (validTemp(t0)) {
+      ground = t0;
+      if (count > 1) {
+        float t1 = sensors.getTempCByIndex(1);
+        if (validTemp(t1)) air = t1;
+      }
+      break;
+    }
+    delay(200);
+  }
+
+  uint32_t n = nextN();
+  bool newFile = !LittleFS.exists("/log.csv");
+  File f = LittleFS.open("/log.csv", "a");
+  if (f) {
+    if (newFile) f.print("nr,maa,ohk\n");
+    f.printf("%u,", (unsigned)n);
+    if (isnan(ground)) f.print("ERR,"); else f.printf("%.2f,", ground);
+    if (count > 1) { if (isnan(air)) f.print("ERR"); else f.printf("%.2f", air); }
+    f.print("\n");
+    f.close();
+  }
+}
+
+// ---------- Kokkuvõte ----------
+String getField(const String& line, int idx) {
+  int start = 0;
+  for (int i = 0; i < idx; i++) {
+    start = line.indexOf(',', start);
+    if (start < 0) return "";
+    start++;
+  }
+  int end = line.indexOf(',', start);
+  if (end < 0) end = line.length();
+  String s = line.substring(start, end);
+  s.trim();
+  return s;
+}
+
+bool isNum(const String& s) { return s.length() > 0 && s != "ERR"; }
+
+String buildSummary() {
+  File f = LittleFS.open("/log.csv", "r");
+  if (!f) return "Logi on tühi.";
+
+  unsigned int cnt = 0, errs = 0, frost = 0, marginal = 0;
+  unsigned int minN = 0, maxN = 0, minAirN = 0, nLast = 0;
+  float minT = 1000, maxT = -1000, sumT = 0, minAir = 1000;
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0 || !isdigit(line[0])) continue;
+
+    unsigned int n = getField(line, 0).toInt();
+    nLast = n;
+    String g = getField(line, 1), a = getField(line, 2);
+
+    if (isNum(g)) {
+      float t = g.toFloat();
+      cnt++; sumT += t;
+      if (t < minT) { minT = t; minN = n; }
+      if (t > maxT) { maxT = t; maxN = n; }
+      if (t <= 0.0) frost++;
+      else if (t <= 1.0) marginal++;
+    } else errs++;
+
+    if (isNum(a)) {
+      float t = a.toFloat();
+      if (t < minAir) { minAir = t; minAirN = n; }
+    }
+  }
+  f.close();
+
+  String s;
+  char b[160];
+  snprintf(b, sizeof(b), "Mõõtmisi: %u (vigaseid: %u), ~%.0f päeva<br>", cnt, errs, nLast / (float)READS_PER_DAY);
+  s += b;
+  if (cnt) {
+    snprintf(b, sizeof(b), "<b>MAA min:</b> %.2f °C (nr %u, ~%.1f. päev)<br>", minT, minN, minN / (float)READS_PER_DAY); s += b;
+    snprintf(b, sizeof(b), "MAA max: %.2f °C (nr %u, ~%.1f. päev)<br>", maxT, maxN, maxN / (float)READS_PER_DAY); s += b;
+    snprintf(b, sizeof(b), "MAA keskmine: %.2f °C<br>", sumT / cnt); s += b;
+    snprintf(b, sizeof(b), "Mõõtmisi &le; 0 °C: %u<br>Mõõtmisi 0...+1 °C: %u<br>", frost, marginal); s += b;
+  }
+  if (minAir < 999) {
+    snprintf(b, sizeof(b), "ÕHK min: %.2f °C (nr %u, ~%.1f. päev)<br>", minAir, minAirN, minAirN / (float)READS_PER_DAY); s += b;
+  }
+  return s;
+}
+
+// ---------- Veebileht ----------
+void handleRoot() {
+  lastActivity = millis();
+  String p = "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+             "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+             "<title>Suvila logger</title><style>"
+             "body{font-family:sans-serif;margin:16px;max-width:600px;line-height:1.5}"
+             "a.b,button{display:block;box-sizing:border-box;width:100%;padding:14px;margin:12px 0;"
+             "background:#185FA5;color:#fff;text-align:center;border:0;border-radius:8px;"
+             "font-size:18px;text-decoration:none}"
+             "button.r{background:#A32D2D}a.g{background:#5F5E5A}"
+             "</style></head><body><h2>Suvila logger</h2>";
+  p += buildSummary();
+  p += "<br>Järgmine mõõtmine ~" + String(gRtc.hopsLeft) + " h pärast.";
+  p += "<a class='b' href='/log.csv'>Lae alla log.csv</a>";
+  p += "<a class='b g' href='/done'>Valmis (mine magama)</a>";
+  p += "<button class='r' onclick=\"if(confirm('Kustutada kogu logi?'))location='/clear'\">Kustuta logi</button>";
+  p += "</body></html>";
+  server.send(200, "text/html; charset=utf-8", p);
+}
+
+void handleCsv() {
+  lastActivity = millis();
+  File f = LittleFS.open("/log.csv", "r");
+  if (!f) { server.send(404, "text/plain", "Logi on tühi"); return; }
+  server.sendHeader("Content-Disposition", "attachment; filename=log.csv");
+  server.streamFile(f, "text/csv");
+  f.close();
+}
+
+void handleClear() {
+  lastActivity = millis();
+  LittleFS.remove("/log.csv");
+  LittleFS.remove("/n");
+  server.sendHeader("Location", "/");
+  server.send(303);
+}
+
+void handleDone() {
+  server.send(200, "text/html; charset=utf-8",
+              "<html><body style='font-family:sans-serif;margin:16px'>"
+              "<h2>Valmis</h2>Seade läheb magama. Eemalda magnet lülitist.</body></html>");
+  delay(300);
+  apDone = true;
+}
+
+void runAccessPoint() {
+  Serial.begin(115200);
+  Serial.println("--- LOG START ---");
+  File f = LittleFS.open("/log.csv", "r");
+  if (f) { while (f.available()) Serial.write(f.read()); f.close(); }
+  Serial.println("--- LOG END ---");
+
+#if USE_11B
+  WiFi.setPhyMode(WIFI_PHY_MODE_11B);
+#endif
+  WiFi.mode(WIFI_AP);
+  WiFi.softAP(AP_SSID, AP_PASS, AP_CHANNEL, 0, 2);
+  WiFi.setOutputPower(TX_DBM);
+
+  server.on("/", handleRoot);
+  server.on("/log.csv", handleCsv);
+  server.on("/clear", handleClear);
+  server.on("/done", handleDone);
+  server.begin();
+
+  lastActivity = millis();
+  while (!apDone && millis() - lastActivity < AP_TIMEOUT_MS) {
+    server.handleClient();
+    delay(2);
+  }
+
+  server.stop();
+  WiFi.softAPdisconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+
+// ---------- Põhiprogramm ----------
+void setup() {
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_OFF);
+  LittleFS.begin();
+
+  uint32_t reason = ESP.getResetInfoPtr()->reason;
+  bool valid = rtcLoad(gRtc);
+
+  // magnet eemaldati (RST vabanes): WiFi-seanss
+  if (valid && reason == REASON_EXT_SYS_RST) {
+    runAccessPoint();
+    uint64_t used = (uint64_t)millis() * 1000ULL;
+    sleepFor(used < HOP_US ? HOP_US - used : 1000000ULL);
+  }
+
+  if (valid && reason == REASON_DEEP_SLEEP_AWAKE) {
+    if (gRtc.hopsLeft > 0) gRtc.hopsLeft--;
+    if (gRtc.hopsLeft == 0) {
+      measureAndLog();
+      gRtc.hopsLeft = HOPS_PER_MEAS;
+    }
+  } else {
+    // esmakordne käivitus või toide katkes: mõõda kohe
+    measureAndLog();
+    gRtc.hopsLeft = HOPS_PER_MEAS;
+  }
+
+  rtcSave(gRtc);
+  sleepFor(HOP_US);
+}
+
+void loop() {}
